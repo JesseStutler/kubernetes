@@ -61,6 +61,8 @@ const (
 
 // preFilterState computed at PreFilter and used at Filter.
 type preFilterState struct {
+	// Namespace of the pod being scheduled.
+	namespace string
 	// Names of the pod's volumes using the ReadWriteOncePod access mode.
 	readWriteOncePodPVCs sets.Set[string]
 	// The number of references to these ReadWriteOncePod volumes by scheduled pods.
@@ -72,8 +74,12 @@ func (s *preFilterState) updateWithPod(podInfo fwk.PodInfo, multiplier int) {
 }
 
 func (s *preFilterState) conflictingPVCRefCountForPod(podInfo fwk.PodInfo) int {
+	pod := podInfo.GetPod()
+	if pod.Namespace != s.namespace || len(s.readWriteOncePodPVCs) == 0 {
+		return 0
+	}
 	conflicts := 0
-	for _, volume := range podInfo.GetPod().Spec.Volumes {
+	for _, volume := range pod.Spec.Volumes {
 		if volume.PersistentVolumeClaim == nil {
 			continue
 		}
@@ -90,6 +96,7 @@ func (s *preFilterState) Clone() fwk.StateData {
 		return nil
 	}
 	return &preFilterState{
+		namespace:              s.namespace,
 		readWriteOncePodPVCs:   s.readWriteOncePodPVCs,
 		conflictingPVCRefCount: s.conflictingPVCRefCount,
 	}
@@ -245,6 +252,7 @@ func (pl *VolumeRestrictions) calPreFilterState(ctx context.Context, pod *v1.Pod
 		}
 	}
 	return &preFilterState{
+		namespace:              pod.Namespace,
 		readWriteOncePodPVCs:   pvcs,
 		conflictingPVCRefCount: conflictingPVCRefCount,
 	}, nil

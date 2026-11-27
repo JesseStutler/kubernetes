@@ -924,6 +924,7 @@ func TestReadWriteOncePodPreemption(t *testing.T) {
 	go testCtx.Scheduler.Run(testCtx.SchedulerCtx)
 
 	cs := testCtx.Client()
+	otherNS := schedulerutils.WithNewNamespace(t, testCtx.TContext, "other-preemption").Namespace()
 
 	storage := v1.VolumeResourceRequirements{Requests: v1.ResourceList{v1.ResourceStorage: resource.MustParse("1Mi")}}
 	volType := v1.HostPathDirectoryOrCreate
@@ -951,6 +952,15 @@ func TestReadWriteOncePodPreemption(t *testing.T) {
 	pvc2 := st.MakePersistentVolumeClaim().
 		Name("pvc-with-read-write-once-pod-2").
 		Namespace(testCtx.Namespace()).
+		// Annotation and volume name required for PVC to be considered bound.
+		Annotation(volume.AnnBindCompleted, "true").
+		VolumeName(pv2.Name).
+		AccessModes([]v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod}).
+		Resources(storage).
+		Obj()
+	pvc1OtherNS := st.MakePersistentVolumeClaim().
+		Name(pvc1.Name).
+		Namespace(otherNS).
 		// Annotation and volume name required for PVC to be considered bound.
 		Annotation(volume.AnnBindCompleted, "true").
 		VolumeName(pv2.Name).
@@ -1182,6 +1192,147 @@ func TestReadWriteOncePodPreemption(t *testing.T) {
 				return nil
 			},
 		},
+		{
+			name: "do not preempt pod with same PVC name in different namespace",
+			init: func() error {
+				for _, pv := range []*v1.PersistentVolume{pv1, pv2} {
+					if _, err := createPV(testCtx, cs, pv); err != nil {
+						return fmt.Errorf("cannot create pv: %v", err)
+					}
+				}
+				for _, pvc := range []*v1.PersistentVolumeClaim{pvc1, pvc1OtherNS} {
+					if _, err := createPVC(testCtx, cs, pvc); err != nil {
+						return fmt.Errorf("cannot create pvc: %v", err)
+					}
+				}
+				return nil
+			},
+			existingPods: []*v1.Pod{
+				initPausePod(&testutils.PausePodConfig{
+					Name:      "holder-pod",
+					Namespace: testCtx.Namespace(),
+					Priority:  &highPriority,
+					Volumes: []v1.Volume{{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvc1.Name,
+							},
+						},
+					}},
+				}),
+				initPausePod(&testutils.PausePodConfig{
+					Name:      "unrelated-pod",
+					Namespace: otherNS,
+					Priority:  &lowPriority,
+					Volumes: []v1.Volume{{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvc1OtherNS.Name,
+							},
+						},
+					}},
+				}),
+			},
+			pod: initPausePod(&testutils.PausePodConfig{
+				Name:      "preemptor-pod",
+				Namespace: testCtx.Namespace(),
+				Priority:  &mediumPriority,
+				Volumes: []v1.Volume{{
+					Name: "volume",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvc1.Name,
+						},
+					},
+				}},
+			}),
+			cleanup: func() error {
+				for _, pvc := range []*v1.PersistentVolumeClaim{pvc1, pvc1OtherNS} {
+					if err := deletePVC(testCtx, cs, pvc.Name, pvc.Namespace); err != nil {
+						return fmt.Errorf("cannot delete pvc: %v", err)
+					}
+				}
+				for _, pv := range []*v1.PersistentVolume{pv1, pv2} {
+					if err := deletePV(testCtx, cs, pv.Name); err != nil {
+						return fmt.Errorf("cannot delete pv: %v", err)
+					}
+				}
+				return nil
+			},
+		},
+		{
+			name: "preempt only same-namespace holder when different namespace has lower-priority pod with same PVC name",
+			init: func() error {
+				for _, pv := range []*v1.PersistentVolume{pv1, pv2} {
+					if _, err := createPV(testCtx, cs, pv); err != nil {
+						return fmt.Errorf("cannot create pv: %v", err)
+					}
+				}
+				for _, pvc := range []*v1.PersistentVolumeClaim{pvc1, pvc1OtherNS} {
+					if _, err := createPVC(testCtx, cs, pvc); err != nil {
+						return fmt.Errorf("cannot create pvc: %v", err)
+					}
+				}
+				return nil
+			},
+			existingPods: []*v1.Pod{
+				initPausePod(&testutils.PausePodConfig{
+					Name:      "victim-pod",
+					Namespace: testCtx.Namespace(),
+					Priority:  &mediumPriority,
+					Volumes: []v1.Volume{{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvc1.Name,
+							},
+						},
+					}},
+				}),
+				initPausePod(&testutils.PausePodConfig{
+					Name:      "unrelated-pod",
+					Namespace: otherNS,
+					Priority:  &lowPriority,
+					Volumes: []v1.Volume{{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+								ClaimName: pvc1OtherNS.Name,
+							},
+						},
+					}},
+				}),
+			},
+			pod: initPausePod(&testutils.PausePodConfig{
+				Name:      "preemptor-pod",
+				Namespace: testCtx.Namespace(),
+				Priority:  &highPriority,
+				Volumes: []v1.Volume{{
+					Name: "volume",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvc1.Name,
+						},
+					},
+				}},
+			}),
+			preemptedPodIndexes: map[int]struct{}{0: {}},
+			cleanup: func() error {
+				for _, pvc := range []*v1.PersistentVolumeClaim{pvc1, pvc1OtherNS} {
+					if err := deletePVC(testCtx, cs, pvc.Name, pvc.Namespace); err != nil {
+						return fmt.Errorf("cannot delete pvc: %v", err)
+					}
+				}
+				for _, pv := range []*v1.PersistentVolume{pv1, pv2} {
+					if err := deletePV(testCtx, cs, pv.Name); err != nil {
+						return fmt.Errorf("cannot delete pv: %v", err)
+					}
+				}
+				return nil
+			},
+		},
 	}
 
 	// Create a node with some resources and a label.
@@ -1229,6 +1380,18 @@ func TestReadWriteOncePodPreemption(t *testing.T) {
 						t.Errorf("Error while creating high priority pod: %v", err)
 					}
 					pods = append(pods, preemptor)
+					if len(test.preemptedPodIndexes) == 0 {
+						if err := waitForPodUnschedulable(testCtx, cs, preemptor); err != nil {
+							t.Fatalf("Preemptor pod %v/%v did not become unschedulable: %v", preemptor.Namespace, preemptor.Name, err)
+						}
+						gotPreemptor, err := cs.CoreV1().Pods(preemptor.Namespace).Get(testCtx, preemptor.Name, metav1.GetOptions{})
+						if err != nil {
+							t.Fatalf("Error getting preemptor pod %v/%v: %v", preemptor.Namespace, preemptor.Name, err)
+						}
+						if gotPreemptor.Status.NominatedNodeName != "" {
+							t.Errorf("Expected no NominatedNodeName for pod %v/%v, got %q", preemptor.Namespace, preemptor.Name, gotPreemptor.Status.NominatedNodeName)
+						}
+					}
 					// Wait for preemption of pods and make sure the other ones are not preempted.
 					for i, p := range pods {
 						if _, found := test.preemptedPodIndexes[i]; found {
@@ -1237,8 +1400,11 @@ func TestReadWriteOncePodPreemption(t *testing.T) {
 								t.Errorf("Pod %v/%v is not getting evicted.", p.Namespace, p.Name)
 							}
 						} else {
-							if p.DeletionTimestamp != nil {
-								t.Errorf("Didn't expect pod %v to get preempted.", p.Name)
+							gotPod, err := cs.CoreV1().Pods(p.Namespace).Get(testCtx, p.Name, metav1.GetOptions{})
+							if err != nil {
+								t.Errorf("Expected pod %v/%v to remain present, got error: %v", p.Namespace, p.Name, err)
+							} else if gotPod.DeletionTimestamp != nil {
+								t.Errorf("Didn't expect pod %v/%v to get preempted.", p.Namespace, p.Name)
 							}
 						}
 					}
