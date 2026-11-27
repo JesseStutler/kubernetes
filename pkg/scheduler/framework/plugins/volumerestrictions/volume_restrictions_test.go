@@ -486,6 +486,122 @@ func TestAccessModeConflicts(t *testing.T) {
 	}
 }
 
+func TestPreFilterExtensionsReadWriteOncePod(t *testing.T) {
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "node-1",
+		},
+	}
+
+	pvcNS1 := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns-1",
+			Name:      "data",
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod},
+		},
+	}
+	pvcNS2 := &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ns-2",
+			Name:      "data",
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOncePod},
+		},
+	}
+
+	holderNS1 := st.MakePod().Name("holder").Namespace("ns-1").PVC("data").Node("node-1").Obj()
+	unrelatedNS2 := st.MakePod().Name("unrelated").Namespace("ns-2").PVC("data").Node("node-1").Obj()
+	incomingNS1 := st.MakePod().Name("incoming").Namespace("ns-1").PVC("data").Obj()
+
+	conflictStatus := fwk.NewStatus(fwk.Unschedulable, ErrReasonReadWriteOncePodConflict)
+
+	type step struct {
+		op         string // "remove" or "add"
+		pod        *v1.Pod
+		wantStatus *fwk.Status
+	}
+
+	tests := []struct {
+		name         string
+		existingPods []*v1.Pod
+		steps        []step
+	}{
+		{
+			name:         "remove and add conflicting pod in same namespace",
+			existingPods: []*v1.Pod{holderNS1},
+			steps: []step{
+				{op: "remove", pod: holderNS1, wantStatus: nil},
+				{op: "add", pod: holderNS1, wantStatus: conflictStatus},
+			},
+		},
+		{
+			name:         "remove pod with same PVC name in different namespace does not resolve conflict",
+			existingPods: []*v1.Pod{holderNS1, unrelatedNS2},
+			steps: []step{
+				{op: "remove", pod: unrelatedNS2, wantStatus: conflictStatus},
+			},
+		},
+		{
+			name:         "add pod with same PVC name in different namespace does not cause conflict",
+			existingPods: []*v1.Pod{holderNS1, unrelatedNS2},
+			steps: []step{
+				{op: "remove", pod: holderNS1, wantStatus: nil},
+				{op: "add", pod: unrelatedNS2, wantStatus: nil},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			p := newPluginWithListers(ctx, t, test.existingPods, []*v1.Node{node}, []*v1.PersistentVolumeClaim{pvcNS1, pvcNS2})
+			preFilterPlugin := p.(fwk.PreFilterPlugin)
+			filterPlugin := p.(fwk.FilterPlugin)
+			ext := preFilterPlugin.PreFilterExtensions()
+
+			cycleState := framework.NewCycleState()
+			_, preFilterStatus := preFilterPlugin.PreFilter(ctx, cycleState, incomingNS1, nil)
+			if !preFilterStatus.IsSuccess() {
+				t.Fatalf("Unexpected PreFilter status: %v", preFilterStatus)
+			}
+
+			// Clone cycleState to mirror preemption/nominated-pod evaluation and verify Clone preserves state.
+			clonedState := cycleState.Clone()
+			nodeInfo := framework.NewNodeInfo(test.existingPods...)
+
+			for i, s := range test.steps {
+				podInfo, err := framework.NewPodInfo(s.pod)
+				if err != nil {
+					t.Fatalf("step %d: NewPodInfo failed: %v", i, err)
+				}
+				var extStatus *fwk.Status
+				switch s.op {
+				case "remove":
+					extStatus = ext.RemovePod(ctx, clonedState, incomingNS1, podInfo, nodeInfo)
+				case "add":
+					extStatus = ext.AddPod(ctx, clonedState, incomingNS1, podInfo, nodeInfo)
+				default:
+					t.Fatalf("step %d: unknown op %q", i, s.op)
+				}
+				if !extStatus.IsSuccess() {
+					t.Fatalf("step %d (%s): unexpected extension status: %v", i, s.op, extStatus)
+				}
+
+				gotStatus := filterPlugin.Filter(ctx, clonedState, incomingNS1, nodeInfo)
+				if diff := cmp.Diff(s.wantStatus, gotStatus); diff != "" {
+					t.Errorf("step %d (%s): unexpected Filter status (-want, +got): %s", i, s.op, diff)
+				}
+			}
+		})
+	}
+}
+
 func Test_isSchedulableAfterAssignedPodDeleted(t *testing.T) {
 	GCEDiskVolState := v1.Volume{
 		VolumeSource: v1.VolumeSource{
